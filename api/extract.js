@@ -1,9 +1,16 @@
-// api/extract.js — Vercel serverless function
-// This is the ONLY place the Anthropic API key lives.
-// The browser never sees it. All extraction calls go through here.
+// api/extract.js — Vercel serverless function (Node.js runtime)
+// Node.js runtime handles large request bodies (base64-encoded PDFs).
+// Edge runtime has a 4MB body limit which blocks real medical PDFs.
+
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '50mb',
+    },
+  },
+};
 
 export default async function handler(req, res) {
-  // Only allow POST
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -16,7 +23,10 @@ export default async function handler(req, res) {
   try {
     const { messages, max_tokens, temperature } = req.body;
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    // Stream the response from Anthropic back to the client.
+    // Streaming keeps the connection alive and avoids timeout issues
+    // on documents that take longer than a few seconds to process.
+    const anthropicResponse = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -28,16 +38,59 @@ export default async function handler(req, res) {
         max_tokens: max_tokens || 8192,
         temperature: temperature ?? 0,
         messages,
+        stream: true,
       }),
     });
 
-    if (!response.ok) {
-      const error = await response.text();
-      return res.status(response.status).json({ error });
+    if (!anthropicResponse.ok) {
+      const error = await anthropicResponse.text();
+      return res.status(anthropicResponse.status).json({ error });
     }
 
-    const data = await response.json();
-    return res.status(200).json(data);
+    // Collect the full streamed response and reconstruct the final message
+    // in the same shape as a non-streaming response so the frontend works
+    // without any changes.
+    const reader = anthropicResponse.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    let stopReason = null;
+    let inputTokens = 0;
+    let outputTokens = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
+
+      for (const line of lines) {
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const event = JSON.parse(data);
+          if (event.type === 'content_block_delta' && event.delta?.text) {
+            fullText += event.delta.text;
+          }
+          if (event.type === 'message_delta' && event.delta?.stop_reason) {
+            stopReason = event.delta.stop_reason;
+          }
+          if (event.type === 'message_start' && event.message?.usage) {
+            inputTokens = event.message.usage.input_tokens;
+          }
+          if (event.type === 'message_delta' && event.usage) {
+            outputTokens = event.usage.output_tokens;
+          }
+        } catch (e) {}
+      }
+    }
+
+    return res.status(200).json({
+      content: [{ type: 'text', text: fullText }],
+      stop_reason: stopReason,
+      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+    });
+
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
