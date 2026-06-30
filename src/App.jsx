@@ -152,11 +152,12 @@ function downscaleImage(file, maxDim = IMAGE_MAX_DIMENSION, quality = 0.85) {
 // Pass 2: re-send the SAME document once per small batch of dates from the index, asking
 // only for full detail on those specific dates. Each chunk is small enough to finish
 // comfortably. Results are merged back into the same shape the rest of the app expects.
-// ---- Dense document fallback ----
-// When a document is too large for one pass, we run two lighter passes:
-// 1. An index pass that gets all dates and basic info
-// 2. Detail passes in small batches of 4 dates at a time
-// This is controlled and predictable — a 40-visit document costs ~11 API calls total.
+// All of this happens automatically — the person uploading never sees or does any of it.
+
+// ---- Dense document fallback (artifact-only — billed to Claude.ai, not your API key) ----
+// When a single pass can't fit the whole document, we run two lighter passes instead
+// of failing outright: an index pass to find every date, then small detail batches.
+// This stays controlled — a 40-visit document costs about 11 total calls, not unbounded.
 
 function chunk(arr, size) {
   const out = [];
@@ -208,22 +209,11 @@ Return ONLY valid JSON matching this shape:
 }`;
 }
 
-async function callAnthropicDirect(content, maxTokens, onProgress, progressLabel) {
-  onProgress && onProgress(progressLabel || "Processing…");
+async function callClaudeRaw(content, maxTokens) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": import.meta.env.VITE_ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: maxTokens,
-      temperature: 0,
-      messages: [{ role: "user", content }],
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, temperature: 0, messages: [{ role: "user", content }] }),
   });
   if (!res.ok) throw new Error(`API error ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
@@ -234,15 +224,12 @@ async function callAnthropicDirect(content, maxTokens, onProgress, progressLabel
   try { return JSON.parse(cleaned); } catch (e) { return null; }
 }
 
-async function extractDense(base64, mediaType, prompt, onProgress) {
+async function extractDense(base64, mediaType, onProgress) {
   const isPdf = mediaType === "application/pdf";
   const docContent = { type: isPdf ? "document" : "image", source: { type: "base64", media_type: mediaType, data: base64 } };
 
-  // Pass 1 — lightweight index of all dates
-  const idx = await callAnthropicDirect(
-    [docContent, { type: "text", text: buildIndexPrompt() }],
-    4096, onProgress, "Indexing all visits in this document…"
-  );
+  onProgress && onProgress("Indexing all visits in this document…");
+  const idx = await callClaudeRaw([docContent, { type: "text", text: buildIndexPrompt() }], 4096);
   if (!idx) throw new Error("Could not read this document's index. Please try again.");
 
   const dates = (idx.dates || []).filter(d => d && d.date);
@@ -251,15 +238,11 @@ async function extractDense(base64, mediaType, prompt, onProgress) {
       plain_summary: "No dated visits found.", flags: [], extraction_notes: null };
   }
 
-  // Pass 2 — detail in batches of 4 dates
   const batches = chunk(dates, 4);
   const allEvents = [];
   for (let i = 0; i < batches.length; i++) {
-    const label = `Extracting visits ${i * 4 + 1}–${Math.min((i + 1) * 4, dates.length)} of ${dates.length}…`;
-    const detail = await callAnthropicDirect(
-      [docContent, { type: "text", text: buildDetailPrompt(batches[i]) }],
-      4096, onProgress, label
-    );
+    onProgress && onProgress(`Extracting visits ${i * 4 + 1}–${Math.min((i + 1) * 4, dates.length)} of ${dates.length}…`);
+    const detail = await callClaudeRaw([docContent, { type: "text", text: buildDetailPrompt(batches[i]) }], 4096);
     if (detail?.events) allEvents.push(...detail.events);
   }
 
@@ -291,12 +274,7 @@ async function callClaude(base64, mediaType, prompt, onProgress) {
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": import.meta.env.VITE_ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
       max_tokens: 8192,
@@ -315,10 +293,8 @@ async function callClaude(base64, mediaType, prompt, onProgress) {
   }
   const data = await res.json();
 
-  // Automatic fallback for dense documents — runs multi-pass extraction
-  // instead of showing an error. The user just sees the progress label change.
   if (data.stop_reason === "max_tokens") {
-    return await extractDense(base64, mediaType, prompt, onProgress);
+    return await extractDense(base64, mediaType, onProgress);
   }
 
   const text = (data.content || []).map(b => b.text || "").join("\n").trim();
@@ -333,11 +309,170 @@ async function callClaude(base64, mediaType, prompt, onProgress) {
 /* ============================ Small UI atoms ============================ */
 // A genuinely detailed visit row — used in the Visits panel, year browser, and
 // chronological summary, so a visit never reads as a thin one-line writeoff.
+// A horizontal zigzag timeline — one color-coded bar segment per year, with circle
+// nodes alternating above/below, matching a classic infographic timeline style.
+// Years are oldest-to-newest left-to-right (a timeline reads left-to-right as a story,
+// even though the rest of the dashboard is newest-first).
+const TIMELINE_PALETTE = [
+  "#F4B23A", "#F0883D", "#E85D52", "#D8366B", "#A93A9E",
+  "#6A3FB0", "#3D5BC4", "#2E8FC4", "#2DA89A", "#4BAE5C",
+];
+
+// Slim fixed side navigation — jump to dashboard sections or back to top.
+// Only renders once there's a dashboard to navigate (i.e. at least one document done).
+const NAV_SECTIONS = [
+  { id: "section-overview", label: "Overview", icon: "LayoutGrid" },
+  { id: "section-timeline", label: "Timeline", icon: "Clock" },
+  { id: "section-visits", label: "Visits", icon: "Stethoscope" },
+  { id: "section-search", label: "Search", icon: "Search" },
+  { id: "section-summary", label: "Summary", icon: "ListOrdered" },
+];
+
+function SideNav({ visible }) {
+  const [activeId, setActiveId] = useState(null);
+  const [showTopBtn, setShowTopBtn] = useState(false);
+
+  React.useEffect(() => {
+    if (!visible) return;
+    const onScroll = () => {
+      setShowTopBtn(window.scrollY > 400);
+      // Find whichever tracked section is currently nearest the top of the viewport.
+      let current = null;
+      for (const s of NAV_SECTIONS) {
+        const el = document.getElementById(s.id);
+        if (el && el.getBoundingClientRect().top < 160) current = s.id;
+      }
+      setActiveId(current);
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+    return () => window.removeEventListener("scroll", onScroll);
+  }, [visible]);
+
+  if (!visible) return null;
+
+  const jumpTo = (id) => {
+    const el = document.getElementById(id);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  const ICONS = { LayoutGrid, Clock, Stethoscope, Search, ListOrdered };
+
+  return (
+    <div className="no-print" style={{
+      position: "fixed", left: 18, top: 0, bottom: 0, margin: "auto", zIndex: 40,
+      height: "fit-content",
+      display: "flex", flexDirection: "column", gap: 4, background: "#fff",
+      border: "1px solid #E1E6EB", borderRadius: 14, padding: 8,
+      boxShadow: "0 8px 24px -8px rgba(14,28,43,.18)",
+    }}>
+      {NAV_SECTIONS.map(s => {
+        const Icon = ICONS[s.icon];
+        const isActive = activeId === s.id;
+        return (
+          <button
+            key={s.id}
+            onClick={() => jumpTo(s.id)}
+            style={{
+              display: "flex", alignItems: "center", gap: 9, padding: "8px 12px 8px 9px", borderRadius: 9,
+              background: isActive ? "#0E7C86" : "transparent", border: "none", cursor: "pointer",
+              color: isActive ? "#fff" : "#5C6773", transition: "background .15s, color .15s",
+              whiteSpace: "nowrap",
+            }}
+          >
+            <Icon size={16} style={{ flex: "none" }} />
+            <span style={{ fontSize: 12.5, fontWeight: 600 }}>{s.label}</span>
+          </button>
+        );
+      })}
+      <div style={{ height: 1, background: "#E1E6EB", margin: "3px 4px" }} />
+      <button
+        onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+        style={{
+          display: "flex", alignItems: "center", gap: 9, padding: "8px 12px 8px 9px", borderRadius: 9,
+          background: showTopBtn ? "#F7EFDC" : "transparent", border: "none", cursor: "pointer",
+          color: showTopBtn ? "#B5852A" : "#C7D2DD", transition: "background .15s, color .15s",
+          whiteSpace: "nowrap",
+        }}
+      >
+        <ChevronUp size={16} style={{ flex: "none" }} />
+        <span style={{ fontSize: 12.5, fontWeight: 600 }}>Back to top</span>
+      </button>
+    </div>
+  );
+}
+
+function YearTimeline({ yearCounts, activeYear, onSelectYear }) {
+  if (!yearCounts || yearCounts.length === 0) return null;
+  // yearCounts comes in newest-first (matches the rest of the dashboard); flip for
+  // a left-to-right chronological read, the natural direction for a timeline.
+  const years = [...yearCounts].map(([y, count]) => ({ year: y, count })).sort((a, b) => a.year.localeCompare(b.year));
+  const n = years.length;
+  const segW = 110;
+  const W = Math.max(360, n * segW + 40);
+  const barY = 95;
+  const barH = 26;
+  const stemLen = 38;
+  const nodeR = 22;
+  // Bubbles sit stemLen away from the bar, plus their own radius — compute real
+  // top/bottom extent so the SVG height never clips them, with margin to spare.
+  const topY = barY - stemLen - nodeR - 10;
+  const bottomY = barY + barH + stemLen + nodeR + 10;
+  const H = bottomY - topY;
+
+  return (
+    <div style={{ overflowX: "auto", overflowY: "hidden", paddingBottom: 6 }}>
+      <svg width={W} height={H} viewBox={`0 ${topY} ${W} ${H}`} style={{ display: "block", minWidth: "100%" }}>
+        {years.map(({ year, count }, i) => {
+          const x = 20 + i * segW;
+          const color = TIMELINE_PALETTE[i % TIMELINE_PALETTE.length];
+          const isActive = activeYear === year;
+          const above = i % 2 === 0;
+          const cy = above ? barY - stemLen : barY + barH + stemLen;
+          const stemY1 = above ? barY : barY + barH;
+          const stemY2 = above ? cy + nodeR : cy - nodeR;
+          const cx = x + segW / 2;
+          const isLast = i === n - 1;
+
+          return (
+            <g key={year} style={{ cursor: "pointer" }} onClick={() => onSelectYear(year)}>
+              {/* Bar segment (arrow-shaped on the last one) */}
+              {isLast ? (
+                <polygon
+                  points={`${x},${barY} ${x + segW - 14},${barY} ${x + segW},${barY + barH / 2} ${x + segW - 14},${barY + barH} ${x},${barY + barH}`}
+                  fill={color} opacity={isActive ? 1 : 0.85}
+                />
+              ) : (
+                <rect x={x} y={barY} width={segW} height={barH} fill={color} opacity={isActive ? 1 : 0.85} />
+              )}
+              <text x={cx} y={barY + barH / 2 + 4} textAnchor="middle" fontSize="11" fontWeight="700" fill="#fff" fontFamily="'IBM Plex Mono',monospace">
+                {year}
+              </text>
+
+              {/* Stem connecting bar to circle */}
+              <line x1={cx} y1={stemY1} x2={cx} y2={stemY2} stroke={color} strokeWidth="2" opacity={isActive ? 1 : 0.6} />
+
+              {/* Circle node — shows visit count, not the year (year is already on the bar) */}
+              <circle cx={cx} cy={cy} r={nodeR} fill="#fff" stroke={color} strokeWidth={isActive ? 3 : 2} />
+              <text x={cx} y={cy - 1} textAnchor="middle" fontSize="14" fontWeight="700" fill={isActive ? color : "#16222F"} className="disp">
+                {count}
+              </text>
+              <text x={cx} y={cy + 12} textAnchor="middle" fontSize="7.5" fontWeight="600" fill={isActive ? color : "#8A95A1"} letterSpacing=".03em">
+                {count === 1 ? "VISIT" : "VISITS"}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
 function VisitRow({ d, term }) {
   const [showNotes, setShowNotes] = useState(false);
   const dx = (d.diagnoses || []).filter(x => x.icd10cm); // only coded diagnoses in the card
   const hasNotes = !!(d.plain_summary && d.plain_summary.length > 0);
-  const mainIssue = d.what_happened || d.document_type || "Visit";
+  const mainIssue = (d.what_happened && d.what_happened !== 'null' ? d.what_happened : null) || (d.document_type && d.document_type !== 'null' ? d.document_type : null) || "Visit";
 
   return (
     <div style={{ padding: "13px 15px", borderRadius: 12, background: "#F8FAFB", border: "1px solid #EEF1F4" }}>
@@ -352,7 +487,7 @@ function VisitRow({ d, term }) {
             fontSize: 10, fontWeight: 700, letterSpacing: ".02em", color: "#B5852A",
             background: "#F7EFDC", padding: "2px 8px", borderRadius: 999,
           }}>
-            {d.visit_setting}
+            {d.visit_setting !== 'null' ? d.visit_setting : null}
           </span>
         )}
       </div>
@@ -428,7 +563,7 @@ function ChronoRow({ d, search }) {
   const [showNotes, setShowNotes] = useState(false);
   const dx = (d.diagnoses || []).filter(x => x.icd10cm);
   const hasNotes = !!(d.plain_summary && d.plain_summary.length > 0);
-  const mainIssue = d.what_happened || buildNarrativeLine(d);
+  const mainIssue = (d.what_happened && d.what_happened !== 'null' ? d.what_happened : null) || buildNarrativeLine(d);
 
   return (
     <div style={{ display: "flex", gap: 16, position: "relative" }}>
@@ -443,7 +578,7 @@ function ChronoRow({ d, search }) {
               fontSize: 10, fontWeight: 700, letterSpacing: ".02em", color: "#B5852A",
               background: "#F7EFDC", padding: "2px 8px", borderRadius: 999,
             }}>
-              {d.visit_setting}
+              {d.visit_setting !== 'null' ? d.visit_setting : null}
             </span>
           )}
         </div>
@@ -1197,11 +1332,14 @@ function computeStats(results) {
     const t = e.document_type || "Other";
     typeCounts[t] = (typeCounts[t] || 0) + 1;
 
-    if (e.visit_setting) {
-      settingCounts[e.visit_setting] = (settingCounts[e.visit_setting] || 0) + 1;
+    const setting = e.visit_setting && e.visit_setting !== "null" ? e.visit_setting : null;
+    const happened = e.what_happened && e.what_happened !== "null" ? e.what_happened : null;
+
+    if (setting) {
+      settingCounts[setting] = (settingCounts[setting] || 0) + 1;
     }
-    if (e.what_happened) {
-      whatHappenedCounts[e.what_happened] = (whatHappenedCounts[e.what_happened] || 0) + 1;
+    if (happened) {
+      whatHappenedCounts[happened] = (whatHappenedCounts[happened] || 0) + 1;
     }
     (e.diagnoses || []).forEach(dx => {
       const key = dx.description || "Unspecified";
@@ -1347,6 +1485,26 @@ function canvasToPdfBytes(canvasList) {
 }
 
 async function generatePDF(entries, identity, stats, patientName, mode) {
+  // Canvas text only renders a custom font if it's actually loaded by the time we
+  // draw — without this wait, every font.load() call below silently falls back
+  // to the system default (Arial), which is why the PDF looked generic compared
+  // to the live site even though the CSS @import was already in place for screen use.
+  try {
+    await Promise.all([
+      document.fonts.load('700 24px "Space Grotesk"'),
+      document.fonts.load('700 20px "IBM Plex Mono"'),
+      document.fonts.load('500 20px "IBM Plex Mono"'),
+      document.fonts.load('400 19px "Inter"'),
+      document.fonts.load('600 19px "Inter"'),
+      document.fonts.load('700 19px "Inter"'),
+    ]);
+    await document.fonts.ready;
+  } catch (e) { /* fonts unavailable — falls back gracefully to system sans-serif */ }
+
+  const FONT_DISPLAY = '"Space Grotesk", Arial, sans-serif';
+  const FONT_BODY = '"Inter", Arial, sans-serif';
+  const FONT_MONO = '"IBM Plex Mono", "Courier New", monospace';
+
   const W = 1200, H = 1556; // 2x letter at 96dpi equivalent — sharp on all screens
   const MARGIN = 80, LINE = 26, SMALL_LINE = 20;
   const pages = [];
@@ -1357,6 +1515,7 @@ async function generatePDF(entries, identity, stats, patientName, mode) {
 
   const ink = '#0E1C2B', teal = '#0E7C86', brass = '#B5852A', mid = '#374251', muted = '#647285', light = '#EEF1F4';
 
+  let pageCount = 0;
   const newPage = () => {
     if (y > 0) pages.push(canvas);
     canvas = document.createElement('canvas');
@@ -1364,13 +1523,25 @@ async function generatePDF(entries, identity, stats, patientName, mode) {
     ctx = canvas.getContext('2d');
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, W, H);
+    pageCount++;
     y = 0;
+    // Running header on every page after the first — keeps a loose page identifiable
+    if (pageCount > 1) {
+      ctx.font = `bold 15px ${FONT_DISPLAY}`; ctx.fillStyle = teal;
+      ctx.fillText('OATH RECORDS VAULT', MARGIN, 36);
+      ctx.font = `15px ${FONT_BODY}`; ctx.fillStyle = muted;
+      const nameLabel = patientName || 'Veteran Record';
+      ctx.fillText(nameLabel, W - MARGIN - ctx.measureText(nameLabel).width, 36);
+      ctx.strokeStyle = '#E1E6EB'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(MARGIN, 48); ctx.lineTo(W - MARGIN, 48); ctx.stroke();
+      y = 72;
+    }
   };
 
   const checkY = (needed) => { if (y + needed > H - 80) newPage(); };
 
   const text = (str, x, yy, opts = {}) => {
-    ctx.font = `${opts.style || 'normal'} ${opts.weight || 'normal'} ${opts.size || 22}px ${opts.family || 'Arial, sans-serif'}`;
+    ctx.font = `${opts.style || 'normal'} ${opts.weight || 'normal'} ${opts.size || 22}px ${opts.family || FONT_BODY}`;
     ctx.fillStyle = opts.color || ink;
     if (opts.maxWidth) {
       // Word wrap
@@ -1392,8 +1563,8 @@ async function generatePDF(entries, identity, stats, patientName, mode) {
     return yy;
   };
 
-  const pill = (label, x, yy, bg, fg) => {
-    ctx.font = 'bold 17px Arial';
+  const pill = (label, x, yy, bg, fg, mono = false) => {
+    ctx.font = mono ? `bold 16px ${FONT_MONO}` : `bold 17px ${FONT_BODY}`;
     const w = ctx.measureText(label).width + 20;
     ctx.fillStyle = bg;
     ctx.beginPath(); ctx.roundRect(x, yy - 16, w, 24, 6); ctx.fill();
@@ -1414,27 +1585,65 @@ async function generatePDF(entries, identity, stats, patientName, mode) {
   // Brass rule
   ctx.fillStyle = brass; ctx.fillRect(0, 80, W, 5);
 
-  text('OATH RECORDS VAULT', MARGIN, 48, { weight: 'bold', size: 28, color: '#ffffff', family: 'Arial' });
-  text('HONORING THEIR OATH', MARGIN, 68, { size: 18, color: brass });
+  // Small drawn shield mark, echoing the live site's logo identity
+  const shieldX = MARGIN, shieldY = 22, shieldW = 30, shieldH = 34;
+  ctx.beginPath();
+  ctx.moveTo(shieldX + shieldW / 2, shieldY);
+  ctx.lineTo(shieldX + shieldW, shieldY + 8);
+  ctx.lineTo(shieldX + shieldW, shieldY + 20);
+  ctx.quadraticCurveTo(shieldX + shieldW, shieldY + shieldH, shieldX + shieldW / 2, shieldY + shieldH);
+  ctx.quadraticCurveTo(shieldX, shieldY + shieldH, shieldX, shieldY + 20);
+  ctx.lineTo(shieldX, shieldY + 8);
+  ctx.closePath();
+  ctx.fillStyle = brass; ctx.fill();
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5; ctx.stroke();
+
+  text('OATH RECORDS VAULT', MARGIN + shieldW + 14, 48, { weight: 'bold', size: 28, color: '#ffffff', family: FONT_DISPLAY });
+  text('HONORING THEIR OATH', MARGIN + shieldW + 14, 68, { size: 18, color: brass, family: FONT_BODY });
   const modeLabel = mode === 'veteran' ? 'VETERAN SUMMARY' : 'CLINICAL DETAIL';
-  ctx.font = 'bold 18px Arial'; ctx.fillStyle = brass;
+  ctx.font = `bold 18px ${FONT_DISPLAY}`; ctx.fillStyle = brass;
   ctx.fillText(modeLabel, W - MARGIN - ctx.measureText(modeLabel).width, 48);
 
   y = 120;
-  text(patientName || 'Veteran Record', MARGIN, y, { weight: 'bold', size: 38, color: ink }); y += 44;
+  text(patientName || 'Veteran Record', MARGIN, y, { weight: 'bold', size: 38, color: ink, family: FONT_DISPLAY }); y += 44;
   if (identity.branch || identity.era) {
-    text([identity.branch, identity.era].filter(Boolean).join(' · '), MARGIN, y, { size: 22, color: muted }); y += 30;
+    text([identity.branch, identity.era].filter(Boolean).join(' · '), MARGIN, y, { size: 22, color: muted, family: FONT_BODY }); y += 30;
   }
   const metaLine = `${stats.totalVisits} visits · ${stats.totalDocs} documents · Generated ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
-  text(metaLine, MARGIN, y, { size: 19, color: muted }); y += 20;
+  text(metaLine, MARGIN, y, { size: 19, color: muted, family: FONT_BODY }); y += 20;
   rule(y); y += 30;
 
-  // ---- ENTRIES ----
+  // ---- ENTRIES, grouped with a year header whenever the year changes ----
+  let lastYear = null;
   entries.forEach((d, idx) => {
-    checkY(mode === 'clinical' ? 200 : 140);
+    const yr = d.date ? d.date.slice(0, 4) : null;
+    const isNewYear = yr && yr !== lastYear;
+    const entryHeight = mode === 'clinical' ? 200 : 140;
+
+    // Reserve room for the header AND the entry that follows it together —
+    // never let a year header land alone at the bottom of a page with its
+    // first entry pushed to an otherwise-empty next page.
+    if (isNewYear) {
+      checkY(56 + entryHeight);
+      lastYear = yr;
+      // Year section header — brass pill + rule, gives the document real visual
+      // structure (e.g. "2026" then everything under it, then "2025", etc.)
+      y += 6;
+      ctx.font = `bold 24px ${FONT_DISPLAY}`; ctx.fillStyle = '#ffffff';
+      const labelW = ctx.measureText(yr).width + 28;
+      ctx.fillStyle = brass;
+      ctx.beginPath(); ctx.roundRect(MARGIN, y - 24, labelW, 34, 8); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(yr, MARGIN + 14, y);
+      ctx.strokeStyle = '#E1E6EB'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(MARGIN + labelW + 14, y - 7); ctx.lineTo(W - MARGIN, y - 7); ctx.stroke();
+      y += 32;
+    } else {
+      checkY(entryHeight);
+    }
 
     // Date + visit type
-    ctx.font = 'bold 20px "Courier New", monospace'; ctx.fillStyle = teal;
+    ctx.font = `bold 20px ${FONT_MONO}`; ctx.fillStyle = teal;
     ctx.fillText(formatNarrativeDate(d.date), MARGIN, y);
     if (d.visit_setting) {
       const dateW = ctx.measureText(formatNarrativeDate(d.date)).width;
@@ -1443,8 +1652,8 @@ async function generatePDF(entries, identity, stats, patientName, mode) {
     y += 30;
 
     // Main issue
-    const mainIssue = d.what_happened || d.document_type || 'Visit';
-    ctx.font = 'bold 24px Arial'; ctx.fillStyle = ink;
+    const mainIssue = (d.what_happened && d.what_happened !== 'null' ? d.what_happened : null) || (d.document_type && d.document_type !== 'null' ? d.document_type : null) || 'Visit';
+    ctx.font = `bold 24px ${FONT_DISPLAY}`; ctx.fillStyle = ink;
     const issueLines = [];
     let cur = '';
     mainIssue.split(' ').forEach(w => {
@@ -1460,19 +1669,19 @@ async function generatePDF(entries, identity, stats, patientName, mode) {
     if (d.provider) docParts.push(`Doctor: ${d.provider}`);
     if (d.facility || d.facility_location) docParts.push(`Location: ${[d.facility, d.facility_location].filter(Boolean).join(', ')}`);
     if (docParts.length > 0) {
-      ctx.font = '20px Arial'; ctx.fillStyle = muted;
+      ctx.font = `20px ${FONT_BODY}`; ctx.fillStyle = muted;
       ctx.fillText(docParts.join('    '), MARGIN, y); y += 26;
     }
 
     // ICD-10-CM codes — labeled for the veteran
     const coded = (d.diagnoses || []).filter(x => x.icd10cm);
     if (coded.length > 0) {
-      ctx.font = 'bold 17px Arial'; ctx.fillStyle = muted;
+      ctx.font = `bold 17px ${FONT_BODY}`; ctx.fillStyle = muted;
       ctx.fillText('ICD-10-CM:', MARGIN, y);
       let cx = MARGIN + ctx.measureText('ICD-10-CM:').width + 10;
       coded.forEach(x => {
         const label = x.description ? `${x.icd10cm} · ${x.description}` : x.icd10cm;
-        cx += pill(label, cx, y, light, mid) + 8;
+        cx += pill(label, cx, y, light, mid, true) + 8;
         if (cx > W - MARGIN - 100) { cx = MARGIN; y += 28; }
       });
       y += 28;
@@ -1484,14 +1693,14 @@ async function generatePDF(entries, identity, stats, patientName, mode) {
       if (allDx.length > 0) {
         allDx.forEach(x => {
           checkY(30);
-          ctx.font = '19px Arial'; ctx.fillStyle = mid;
+          ctx.font = `19px ${FONT_BODY}`; ctx.fillStyle = mid;
           ctx.fillText(`• ${x.description}${x.icd10cm ? ` (${x.icd10cm})` : ''}`, MARGIN + 12, y);
           y += 26;
         });
       }
       if (d.plain_summary) {
         checkY(40);
-        ctx.font = 'italic 19px Arial'; ctx.fillStyle = muted;
+        ctx.font = `italic 19px ${FONT_BODY}`; ctx.fillStyle = muted;
         // Wrap notes
         const noteWords = d.plain_summary.split(' ');
         let noteLine = '';
@@ -1513,7 +1722,7 @@ async function generatePDF(entries, identity, stats, patientName, mode) {
   });
 
   // Footer on last page
-  ctx.font = '17px Arial'; ctx.fillStyle = muted;
+  ctx.font = `17px ${FONT_BODY}`; ctx.fillStyle = muted;
   ctx.fillText('Oath Records Vault · Confidential health record · For authorized use only', MARGIN, H - 30);
   pages.push(canvas);
 
@@ -1741,8 +1950,20 @@ export default function App() {
     () => [...allEntries].sort((a, b) => (b.date || "0000").localeCompare(a.date || "0000")),
     [allEntries]
   );
+  // Helper to check if an entry has enough real clinical content to show a veteran
+  const hasVeteranContent = (e) => {
+    const setting = e.visit_setting && e.visit_setting !== "null";
+    const happened = e.what_happened && e.what_happened !== "null";
+    const hasDx = (e.diagnoses || []).length > 0;
+    const hasProvider = !!(e.provider && e.provider !== "null");
+    const hasSummary = !!(e.plain_summary && e.plain_summary !== "null" && e.plain_summary.length > 10);
+    // Show if we have at least one meaningful clinical field
+    return setting || happened || hasDx || hasProvider || hasSummary;
+  };
+
   const filteredResults = useMemo(() => {
     return sortedEntries.filter(e => {
+      if (!hasVeteranContent(e)) return false;
       const matchesText = matchesSearch(e, search);
       const matchesDoctor = !doctorSearch.trim() ||
         (e.provider || "").toLowerCase().includes(doctorSearch.trim().toLowerCase());
@@ -1753,6 +1974,7 @@ export default function App() {
   const yearVisits = useMemo(() => {
     if (!activeYear) return [];
     return sortedEntries.filter(e =>
+      hasVeteranContent(e) &&
       e.date && e.date.startsWith(activeYear) &&
       (!activeLocation || e.facility_location === activeLocation)
     );
@@ -1769,12 +1991,18 @@ export default function App() {
 
   const settingVisits = useMemo(() => {
     if (!activeSetting) return [];
-    return sortedEntries.filter(e => e.visit_setting === activeSetting);
+    return sortedEntries.filter(e =>
+      hasVeteranContent(e) &&
+      e.visit_setting === activeSetting && e.visit_setting !== "null"
+    );
   }, [sortedEntries, activeSetting]);
 
   const reasonVisits = useMemo(() => {
     if (!activeReason) return [];
-    return sortedEntries.filter(e => e.what_happened === activeReason);
+    return sortedEntries.filter(e =>
+      hasVeteranContent(e) &&
+      e.what_happened === activeReason && e.what_happened !== "null"
+    );
   }, [sortedEntries, activeReason]);
 
   const stats = useMemo(() => computeStats(results), [results]);
@@ -1801,6 +2029,7 @@ export default function App() {
           onClose={() => setDownloadModal(false)}
         />
       )}
+      <SideNav visible={doneResults.length > 0} />
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap');
         *{ box-sizing:border-box; }
@@ -1846,6 +2075,9 @@ export default function App() {
         @media print{
           .no-print{ display:none !important; }
           body{ background:#fff; }
+          @page{ margin: 0.6in; }
+          .oath-card{ box-shadow:none !important; border:1px solid #E1E6EB !important; break-inside:avoid; }
+          a[href]:after{ content:""; }
         }
       `}</style>
 
@@ -2072,7 +2304,7 @@ export default function App() {
             )}
 
             {/* Stat tiles */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 22 }} className="no-print">
+            <div id="section-overview" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 22 }} className="no-print">
               <div className="stat-tile">
                 <div className="disp" style={{ fontSize: 24, fontWeight: 700 }}>{stats.totalDocs}</div>
                 <div style={{ fontSize: 11.5, color: "#8A95A1", marginTop: 2 }}>Records in vault</div>
@@ -2095,8 +2327,71 @@ export default function App() {
               </div>
             </div>
 
+            {/* Browse by year, then optionally narrow by location */}
+            {stats.yearCounts.length > 0 && (
+              <div id="section-timeline" className="oath-card no-print" style={{ padding: 16, marginBottom: 22 }}>
+                <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: ".05em", color: "#8A95A1", marginBottom: 10 }}>
+                  BROWSE BY YEAR
+                </div>
+                <YearTimeline
+                  yearCounts={stats.yearCounts}
+                  activeYear={activeYear}
+                  onSelectYear={(year) => {
+                    setActiveYear(activeYear === year ? null : year);
+                    setActiveLocation(null);
+                  }}
+                />
+
+                {activeYear && (
+                  <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid #EEF1F4" }}>
+                    {/* Locations present within the selected year, as a secondary narrowing step */}
+                    {yearLocationOptions.length > 1 && (
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12, alignItems: "center" }}>
+                        <span style={{ fontSize: 11.5, color: "#8A95A1", marginRight: 2 }}>Narrow by where:</span>
+                        {yearLocationOptions.map(([loc, count]) => (
+                          <button
+                            key={loc}
+                            onClick={() => setActiveLocation(activeLocation === loc ? null : loc)}
+                            style={{
+                              display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, fontWeight: 600,
+                              padding: "5px 10px", borderRadius: 999,
+                              border: "1.5px solid " + (activeLocation === loc ? "#0E7C86" : "#DDE2E7"),
+                              background: activeLocation === loc ? "#0E7C86" : "#fff",
+                              color: activeLocation === loc ? "#fff" : "#16222F",
+                            }}
+                          >
+                            <MapPin size={10} /> {loc} <span className="mono" style={{ opacity: .8 }}>{count}×</span>
+                          </button>
+                        ))}
+                        {activeLocation && (
+                          <button onClick={() => setActiveLocation(null)} style={{ fontSize: 11.5, color: "#8A95A1", textDecoration: "underline" }}>
+                            Clear
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                      <span style={{ fontSize: 13, fontWeight: 700 }}>
+                        Visits in {activeYear}{activeLocation ? ` — ${activeLocation}` : ""}
+                      </span>
+                      <span className="mono" style={{ fontSize: 11.5, color: "#8A95A1" }}>
+                        {yearVisits.length} visit{yearVisits.length === 1 ? "" : "s"}
+                      </span>
+                      <button onClick={() => { setActiveYear(null); setActiveLocation(null); }} style={{ marginLeft: "auto", fontSize: 12, color: "#8A95A1", display: "flex", alignItems: "center", gap: 4 }}>
+                        <X size={13} /> Close
+                      </button>
+                    </div>
+
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                      {yearVisits.map(d => <VisitRow key={d.id} d={d} />)}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
             {/* Visits + Reason for Visit — stacked vertically, each with split-panel (left: selector, right: scrollable results) */}
-            <div style={{ display: "flex", flexDirection: "column", gap: 14, marginBottom: 22 }} className="no-print">
+            <div id="section-visits" style={{ display: "flex", flexDirection: "column", gap: 14, marginBottom: 22 }} className="no-print">
 
               {/* VISITS card */}
               <div className="oath-card" style={{ padding: 0, overflow: "hidden" }}>
@@ -2179,87 +2474,8 @@ export default function App() {
 
             </div>
 
-            {/* Browse by year, then optionally narrow by location */}
-            {stats.yearCounts.length > 0 && (
-              <div className="oath-card no-print" style={{ padding: 16, marginBottom: 22 }}>
-                <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: ".05em", color: "#8A95A1", marginBottom: 10 }}>
-                  BROWSE BY YEAR
-                </div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                  {stats.yearCounts.map(([year, count]) => (
-                    <button
-                      key={year}
-                      onClick={() => {
-                        setActiveYear(activeYear === year ? null : year);
-                        setActiveLocation(null);
-                      }}
-                      style={{
-                        display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, fontWeight: 600,
-                        padding: "7px 12px", borderRadius: 999,
-                        border: "1.5px solid " + (activeYear === year ? "#0E7C86" : "#DDE2E7"),
-                        background: activeYear === year ? "#0E7C86" : "#fff",
-                        color: activeYear === year ? "#fff" : "#16222F",
-                      }}
-                    >
-                      <Clock size={12} />
-                      {year}
-                      <span className="mono" style={{ fontSize: 11, opacity: .85 }}>{count}×</span>
-                      {activeYear === year ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-                    </button>
-                  ))}
-                </div>
-
-                {activeYear && (
-                  <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid #EEF1F4" }}>
-                    {/* Locations present within the selected year, as a secondary narrowing step */}
-                    {yearLocationOptions.length > 1 && (
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12, alignItems: "center" }}>
-                        <span style={{ fontSize: 11.5, color: "#8A95A1", marginRight: 2 }}>Narrow by where:</span>
-                        {yearLocationOptions.map(([loc, count]) => (
-                          <button
-                            key={loc}
-                            onClick={() => setActiveLocation(activeLocation === loc ? null : loc)}
-                            style={{
-                              display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, fontWeight: 600,
-                              padding: "5px 10px", borderRadius: 999,
-                              border: "1.5px solid " + (activeLocation === loc ? "#0E7C86" : "#DDE2E7"),
-                              background: activeLocation === loc ? "#0E7C86" : "#fff",
-                              color: activeLocation === loc ? "#fff" : "#16222F",
-                            }}
-                          >
-                            <MapPin size={10} /> {loc} <span className="mono" style={{ opacity: .8 }}>{count}×</span>
-                          </button>
-                        ))}
-                        {activeLocation && (
-                          <button onClick={() => setActiveLocation(null)} style={{ fontSize: 11.5, color: "#8A95A1", textDecoration: "underline" }}>
-                            Clear
-                          </button>
-                        )}
-                      </div>
-                    )}
-
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                      <span style={{ fontSize: 13, fontWeight: 700 }}>
-                        Visits in {activeYear}{activeLocation ? ` — ${activeLocation}` : ""}
-                      </span>
-                      <span className="mono" style={{ fontSize: 11.5, color: "#8A95A1" }}>
-                        {yearVisits.length} visit{yearVisits.length === 1 ? "" : "s"}
-                      </span>
-                      <button onClick={() => { setActiveYear(null); setActiveLocation(null); }} style={{ marginLeft: "auto", fontSize: 12, color: "#8A95A1", display: "flex", alignItems: "center", gap: 4 }}>
-                        <X size={13} /> Close
-                      </button>
-                    </div>
-
-                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                      {yearVisits.map(d => <VisitRow key={d.id} d={d} />)}
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
             {/* Search — two fields: condition/code and doctor name */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }} className="no-print">
+            <div id="section-search" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }} className="no-print">
               <div style={{ position: "relative" }}>
                 <Search size={16} style={{ position: "absolute", left: 14, top: 12, color: "#8A95A1" }} />
                 <input
@@ -2330,7 +2546,7 @@ export default function App() {
 
             {/* Chronological narrative view — the "handoff form" */}
             {view === "narrative" && filteredResults.length > 0 && (
-              <div className="oath-card" style={{ padding: "24px 26px" }}>
+              <div id="section-summary" className="oath-card" style={{ padding: "24px 26px" }}>
                 <div className="disp" style={{ fontSize: 17, fontWeight: 700, marginBottom: 4 }}>
                   Chronological health summary{(displayName || identity.fullName) ? ` — ${displayName || identity.fullName}` : ""}
                 </div>
@@ -2342,9 +2558,33 @@ export default function App() {
                 <div style={{ position: "relative", paddingLeft: 4 }}>
                   <div style={{ position: "absolute", left: 5, top: 6, bottom: 6, width: 1.5, background: "#E1E6EB" }} />
                   <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-                    {filteredResults.map(d => (
-                      <ChronoRow key={d.id} d={d} search={search} />
-                    ))}
+                    {(() => {
+                      let lastYear = null;
+                      return filteredResults.map(d => {
+                        const yr = d.date ? d.date.slice(0, 4) : null;
+                        const showHeader = yr && yr !== lastYear;
+                        lastYear = yr;
+                        return (
+                          <React.Fragment key={d.id}>
+                            {showHeader && (
+                              <div style={{
+                                marginLeft: -4, paddingLeft: 4, display: "flex", alignItems: "center", gap: 10,
+                                marginTop: lastYear === yr ? 0 : 4,
+                              }}>
+                                <span className="disp" style={{
+                                  fontSize: 13, fontWeight: 700, color: "#B5852A", background: "#F7EFDC",
+                                  padding: "3px 12px", borderRadius: 999, letterSpacing: ".02em",
+                                }}>
+                                  {yr}
+                                </span>
+                                <span style={{ flex: 1, height: 1, background: "#EEF1F4" }} />
+                              </div>
+                            )}
+                            <ChronoRow d={d} search={search} />
+                          </React.Fragment>
+                        );
+                      });
+                    })()}
                   </div>
                 </div>
               </div>
