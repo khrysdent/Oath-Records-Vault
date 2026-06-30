@@ -152,7 +152,132 @@ function downscaleImage(file, maxDim = IMAGE_MAX_DIMENSION, quality = 0.85) {
 // Pass 2: re-send the SAME document once per small batch of dates from the index, asking
 // only for full detail on those specific dates. Each chunk is small enough to finish
 // comfortably. Results are merged back into the same shape the rest of the app expects.
-// All of this happens automatically — the person uploading never sees or does any of it.
+// ---- Dense document fallback ----
+// When a document is too large for one pass, we run two lighter passes:
+// 1. An index pass that gets all dates and basic info
+// 2. Detail passes in small batches of 4 dates at a time
+// This is controlled and predictable — a 40-visit document costs ~11 API calls total.
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+function buildIndexPrompt() {
+  return `You are reading a real medical document for a veteran health-records consolidation tool. This document may be dense, spanning many visits.
+
+For this pass, do NOT extract full detail. Just build a lightweight index.
+
+Return ONLY valid JSON (no markdown fences, no commentary) matching this shape:
+{
+  "patient_name": "string or null",
+  "patient_branch": "string or null",
+  "patient_era": "string or null",
+  "document_type": "string",
+  "facility_location": "string or null",
+  "dates": [ { "date": "YYYY-MM-DD or best available", "label": "3-6 words max" } ]
+}
+
+Rules:
+- List EVERY distinct dated clinical encounter. Do not skip any.
+- Never use date of birth, enlistment date, or document print date.
+- Keep labels extremely short (3-6 words max).`;
+}
+
+function buildDetailPrompt(dateBatch) {
+  const dateList = dateBatch.map(d => `- ${d.date} (${d.label})`).join("\n");
+  return `You are reading the same medical document again. Extract FULL detail ONLY for these specific dates — ignore all others:
+${dateList}
+
+Return ONLY valid JSON matching this shape:
+{
+  "events": [
+    {
+      "date": "must match one of the dates above",
+      "label": "short label",
+      "visit_setting": "Primary Care Visit | Specialist Visit | Lab Work | Imaging | ER Visit | Mental Health Visit | Dental Visit | Pharmacy | null",
+      "what_happened": "Preventive Care | Follow-up | Acute Care | Mental Health | Specialist Consultation | Lab / Imaging | Chronic Disease Management | Surgery / Procedure | null",
+      "provider": "string or null",
+      "facility": "string or null",
+      "facility_location": "string or null",
+      "diagnoses": [ { "description": "string", "icd10cm": "code or null", "confidence": "high | medium | low" } ],
+      "notes": "one short sentence or null"
+    }
+  ]
+}`;
+}
+
+async function callAnthropicDirect(content, maxTokens, onProgress, progressLabel) {
+  onProgress && onProgress(progressLabel || "Processing…");
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": import.meta.env.VITE_ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: maxTokens,
+      temperature: 0,
+      messages: [{ role: "user", content }],
+    }),
+  });
+  if (!res.ok) throw new Error(`API error ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const data = await res.json();
+  const text = (data.content || []).map(b => b.text || "").join("\n").trim();
+  let cleaned = text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
+  const fb = cleaned.indexOf("{"); const lb = cleaned.lastIndexOf("}");
+  if (fb !== -1 && lb !== -1 && lb > fb) cleaned = cleaned.slice(fb, lb + 1);
+  try { return JSON.parse(cleaned); } catch (e) { return null; }
+}
+
+async function extractDense(base64, mediaType, prompt, onProgress) {
+  const isPdf = mediaType === "application/pdf";
+  const docContent = { type: isPdf ? "document" : "image", source: { type: "base64", media_type: mediaType, data: base64 } };
+
+  // Pass 1 — lightweight index of all dates
+  const idx = await callAnthropicDirect(
+    [docContent, { type: "text", text: buildIndexPrompt() }],
+    4096, onProgress, "Indexing all visits in this document…"
+  );
+  if (!idx) throw new Error("Could not read this document's index. Please try again.");
+
+  const dates = (idx.dates || []).filter(d => d && d.date);
+  if (dates.length === 0) {
+    return { ...idx, date: null, events: [], diagnoses: [], procedures: [], medications: [],
+      plain_summary: "No dated visits found.", flags: [], extraction_notes: null };
+  }
+
+  // Pass 2 — detail in batches of 4 dates
+  const batches = chunk(dates, 4);
+  const allEvents = [];
+  for (let i = 0; i < batches.length; i++) {
+    const label = `Extracting visits ${i * 4 + 1}–${Math.min((i + 1) * 4, dates.length)} of ${dates.length}…`;
+    const detail = await callAnthropicDirect(
+      [docContent, { type: "text", text: buildDetailPrompt(batches[i]) }],
+      4096, onProgress, label
+    );
+    if (detail?.events) allEvents.push(...detail.events);
+  }
+
+  return {
+    patient_name: idx.patient_name || null,
+    patient_branch: idx.patient_branch || null,
+    patient_era: idx.patient_era || null,
+    document_type: idx.document_type || "Multi-visit chart export",
+    date: null, provider: null, facility: null,
+    facility_location: idx.facility_location || null,
+    events: allEvents,
+    diagnoses: [], procedures: [], medications: [],
+    plain_summary: `${allEvents.length} dated visit${allEvents.length === 1 ? "" : "s"} found across this document.`,
+    flags: allEvents.length < dates.length
+      ? [`${dates.length - allEvents.length} visit(s) from the index could not be fully detailed.`] : [],
+    extraction_notes: null,
+  };
+}
 
 async function callClaude(base64, mediaType, prompt, onProgress) {
   const isPdf = mediaType === "application/pdf";
@@ -190,12 +315,10 @@ async function callClaude(base64, mediaType, prompt, onProgress) {
   }
   const data = await res.json();
 
+  // Automatic fallback for dense documents — runs multi-pass extraction
+  // instead of showing an error. The user just sees the progress label change.
   if (data.stop_reason === "max_tokens") {
-    const err = new Error(
-      "This document has too much content to process in one pass. Try splitting it into smaller files — for example, by date range — and uploading each separately. All pieces will be combined in your vault."
-    );
-    err.truncated = true;
-    throw err;
+    return await extractDense(base64, mediaType, prompt, onProgress);
   }
 
   const text = (data.content || []).map(b => b.text || "").join("\n").trim();
