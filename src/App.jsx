@@ -94,7 +94,7 @@ const FIELD_HELP = {
 };
 
 /* ============================ Size limits & helpers ============================ */
-const MAX_PDF_BYTES = 28 * 1024 * 1024;       // conservative ceiling for base64-encoded PDFs
+const MAX_PDF_BYTES = 32 * 1024 * 1024;       // conservative ceiling for base64-encoded PDFs
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;      // images get auto-downscaled above this
 const IMAGE_MAX_DIMENSION = 2200;             // px, long edge — plenty for OCR-quality reading
 
@@ -164,12 +164,16 @@ async function callClaude(base64, mediaType, prompt, onProgress) {
     { type: "text", text: prompt },
   ];
 
-  // In the deployed app, calls go through /api/extract (our serverless function)
-  // which holds the API key securely on the server. The browser never sees the key.
-  const res = await fetch("/api/extract", {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": import.meta.env.VITE_ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
     body: JSON.stringify({
+      model: "claude-sonnet-4-6",
       max_tokens: 8192,
       temperature: 0,
       messages: [{ role: "user", content }],
