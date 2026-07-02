@@ -1,9 +1,9 @@
 import React, { useState, useRef, useMemo } from "react";
 import {
   Upload, FileText, Loader, Check, AlertTriangle, ChevronDown, ChevronUp,
-  Trash2, Code, Eye, Plus, X, Clock, RotateCcw, Search,
-  LayoutGrid, ListOrdered, Stethoscope, ShieldCheck, Sparkles, ArrowRight,
-  Layers, Printer, Download, MapPin,
+  Trash2, Code, X, Clock, RotateCcw, Search,
+  LayoutGrid, ListOrdered, Stethoscope, ShieldCheck,
+  Layers, Download, MapPin,
 } from "lucide-react";
 
 /* ============================ Defaults ============================ */
@@ -324,19 +324,28 @@ const NAV_SECTIONS = [
   { id: "section-overview", label: "Overview", icon: "LayoutGrid" },
   { id: "section-timeline", label: "Timeline", icon: "Clock" },
   { id: "section-visits", label: "Visits", icon: "Stethoscope" },
+  { id: "section-medications", label: "Medications", icon: "Layers" },
+  { id: "section-conditions", label: "Conditions", icon: "ShieldCheck" },
   { id: "section-search", label: "Search", icon: "Search" },
   { id: "section-summary", label: "Summary", icon: "ListOrdered" },
 ];
 
 function SideNav({ visible }) {
   const [activeId, setActiveId] = useState(null);
+  const [hoverId, setHoverId] = useState(null);
+  const [hoverTop, setHoverTop] = useState(false);
   const [showTopBtn, setShowTopBtn] = useState(false);
+  // Blocks scroll-tracking while a programmatic scroll is in flight — prevents
+  // the scroll handler from immediately overriding the item the user just clicked.
+  const scrollingRef = useRef(false);
+  const scrollTimerRef = useRef(null);
 
   React.useEffect(() => {
     if (!visible) return;
     const onScroll = () => {
       setShowTopBtn(window.scrollY > 400);
-      // Find whichever tracked section is currently nearest the top of the viewport.
+      // While jumpTo() is running, don't let scroll events fight the clicked state.
+      if (scrollingRef.current) return;
       let current = null;
       for (const s of NAV_SECTIONS) {
         const el = document.getElementById(s.id);
@@ -352,11 +361,17 @@ function SideNav({ visible }) {
   if (!visible) return null;
 
   const jumpTo = (id) => {
+    // Set active immediately on click so it feels instant.
+    setActiveId(id);
+    // Lock scroll-tracking for long enough for smooth scroll to land (~800 ms).
+    scrollingRef.current = true;
+    clearTimeout(scrollTimerRef.current);
+    scrollTimerRef.current = setTimeout(() => { scrollingRef.current = false; }, 800);
     const el = document.getElementById(id);
     if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
-  const ICONS = { LayoutGrid, Clock, Stethoscope, Search, ListOrdered };
+  const ICONS = { LayoutGrid, Clock, Stethoscope, Search, ListOrdered, Layers, ShieldCheck };
 
   return (
     <div className="no-print" style={{
@@ -369,14 +384,19 @@ function SideNav({ visible }) {
       {NAV_SECTIONS.map(s => {
         const Icon = ICONS[s.icon];
         const isActive = activeId === s.id;
+        const isHover = hoverId === s.id && !isActive;
         return (
           <button
             key={s.id}
             onClick={() => jumpTo(s.id)}
+            onMouseEnter={() => setHoverId(s.id)}
+            onMouseLeave={() => setHoverId(null)}
             style={{
               display: "flex", alignItems: "center", gap: 9, padding: "8px 12px 8px 9px", borderRadius: 9,
-              background: isActive ? "#0E7C86" : "transparent", border: "none", cursor: "pointer",
-              color: isActive ? "#fff" : "#5C6773", transition: "background .15s, color .15s",
+              background: isActive ? "#0E7C86" : isHover ? "#E9F4F4" : "transparent",
+              border: "none", cursor: "pointer",
+              color: isActive ? "#fff" : isHover ? "#0E7C86" : "#5C6773",
+              transition: "background .12s, color .12s",
               whiteSpace: "nowrap",
             }}
           >
@@ -388,10 +408,14 @@ function SideNav({ visible }) {
       <div style={{ height: 1, background: "#E1E6EB", margin: "3px 4px" }} />
       <button
         onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+        onMouseEnter={() => setHoverTop(true)}
+        onMouseLeave={() => setHoverTop(false)}
         style={{
           display: "flex", alignItems: "center", gap: 9, padding: "8px 12px 8px 9px", borderRadius: 9,
-          background: showTopBtn ? "#F7EFDC" : "transparent", border: "none", cursor: "pointer",
-          color: showTopBtn ? "#B5852A" : "#C7D2DD", transition: "background .15s, color .15s",
+          background: showTopBtn ? "#F7EFDC" : hoverTop ? "#F7EFDC" : "transparent",
+          border: "none", cursor: "pointer",
+          color: showTopBtn || hoverTop ? "#B5852A" : "#C7D2DD",
+          transition: "background .12s, color .12s",
           whiteSpace: "nowrap",
         }}
       >
@@ -1484,7 +1508,7 @@ function canvasToPdfBytes(canvasList) {
   return result;
 }
 
-async function generatePDF(entries, identity, stats, patientName, mode) {
+async function generatePDF(entries, identity, stats, patientName, mode, dob = null) {
   // Canvas text only renders a custom font if it's actually loaded by the time we
   // draw — without this wait, every font.load() call below silently falls back
   // to the system default (Arial), which is why the PDF looked generic compared
@@ -1609,7 +1633,7 @@ async function generatePDF(entries, identity, stats, patientName, mode) {
   if (identity.branch || identity.era) {
     text([identity.branch, identity.era].filter(Boolean).join(' · '), MARGIN, y, { size: 22, color: muted, family: FONT_BODY }); y += 30;
   }
-  const metaLine = `${stats.totalVisits} visits · ${stats.totalDocs} documents · Generated ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
+  const metaLine = `${dob ? `DOB: ${formatNarrativeDate(dob)} (veteran-confirmed) · ` : ''}${stats.totalVisits} visits · ${stats.totalDocs} documents · Generated ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
   text(metaLine, MARGIN, y, { size: 19, color: muted, family: FONT_BODY }); y += 20;
   rule(y); y += 30;
 
@@ -1753,6 +1777,12 @@ export default function App() {
   const [activeYear, setActiveYear] = useState(null);
   const [activeSetting, setActiveSetting] = useState(null);
   const [activeReason, setActiveReason] = useState(null);
+  const [activeCondition, setActiveCondition] = useState(null); // selected condition key for the timeline
+  const [condYear, setCondYear] = useState(null); // year filter within the selected condition
+  const [medYear, setMedYear] = useState(null); // year filter for the medications panel
+  const [alertsOpen, setAlertsOpen] = useState(false); // clinical alerts collapsed by default
+  const [clarifyOpen, setClarifyOpen] = useState(false); // items needing clarification collapsed by default
+  const [profileDOB, setProfileDOB] = useState(null); // veteran-confirmed date of birth (resolves DOB discrepancies)
   // conflict modal state — set when a newly extracted result raises an identity conflict
   const [conflictModal, setConflictModal] = useState(null);
   const [downloadModal, setDownloadModal] = useState(false);
@@ -2005,6 +2035,105 @@ export default function App() {
     );
   }, [sortedEntries, activeReason]);
 
+  // Aggregate all medications across every completed document, newest-first.
+  // Medications live at the document level in the extraction schema (not per-event),
+  // so we pull from results directly rather than sortedEntries.
+  const allMedications = useMemo(() => {
+    const meds = [];
+    results.filter(r => r.status === "done").forEach(r => {
+      const d = r.data;
+      if (d.medications && d.medications.length > 0) {
+        // Use the document's own date, or its earliest event date, as the prescription date context.
+        const sourceDate = d.date || (d.events && d.events.length > 0 ? d.events[0].date : null) || null;
+        d.medications.forEach(m => {
+          if (!m.name || m.name === "null") return;
+          meds.push({
+            name: m.name,
+            dose: (m.dose && m.dose !== "null") ? m.dose : null,
+            instructions: (m.instructions && m.instructions !== "null") ? m.instructions : null,
+            sourceDate,
+            sourceProvider: (d.provider && d.provider !== "null") ? d.provider : null,
+            sourceFacility: (d.facility && d.facility !== "null") ? d.facility : null,
+            sourceFilename: r.filename,
+          });
+        });
+      }
+    });
+    return meds.sort((a, b) => (b.sourceDate || "0000").localeCompare(a.sourceDate || "0000"));
+  }, [results]);
+
+  // Aggregate all clinical flags across every completed document.
+  // Flags capture clinically notable items the AI identified: allergies mentioned,
+  // conflicting dates, illegible sections, medication interactions, etc.
+  const allFlags = useMemo(() => {
+    const flags = [];
+    results.filter(r => r.status === "done").forEach(r => {
+      const d = r.data;
+      if (d.flags && d.flags.length > 0) {
+        d.flags.forEach(f => {
+          if (!f || f === "null") return;
+          flags.push({
+            text: f,
+            sourceFilename: r.filename,
+            sourceDate: d.date || null,
+          });
+        });
+      }
+    });
+    return flags;
+  }, [results]);
+
+  // Split flags into two buckets:
+  // 1. clinicalAlerts — genuinely clinical items (allergies, missing reports, abnormal findings)
+  // 2. clarifications — record-keeping discrepancies the veteran can resolve themselves
+  //    (DOB variations, name spellings, transcription errors, conflicting admin dates)
+  // Classifier is keyword-based on the flag text — a data-quality issue, not a clinical one.
+  const isClarificationFlag = (text) =>
+    /date of birth|dob|birth date|birthdate|transcription error|spelled|spelling|name appears|appears variously|clerical|typo|inconsistent(ly)? (recorded|spelled|dated)|ssn|social security/i.test(text);
+
+  const clinicalAlerts = useMemo(
+    () => allFlags.filter(f => !isClarificationFlag(f.text)),
+    [allFlags]
+  );
+  const clarifications = useMemo(
+    () => allFlags.filter(f => isClarificationFlag(f.text)),
+    [allFlags]
+  );
+  // Whether any clarification mentions a DOB discrepancy — if so, we offer the DOB resolver input
+  const hasDOBDiscrepancy = useMemo(
+    () => clarifications.some(f => /date of birth|dob|birth date|birthdate/i.test(f.text)),
+    [clarifications]
+  );
+
+  // Aggregate all unique conditions/diagnoses across every entry, ranked by frequency.
+  // Each entry in the map carries the list of timeline entries where that condition appears,
+  // deduped by entry id — used to power the condition timeline panel.
+  const allConditions = useMemo(() => {
+    const condMap = {};
+    sortedEntries.forEach(e => {
+      (e.diagnoses || []).forEach(dx => {
+        if (!dx.description || dx.description === "null") return;
+        const key = dx.description.toLowerCase().trim();
+        if (!condMap[key]) {
+          condMap[key] = { label: dx.description, icd10cm: null, count: 0, entryIds: new Set(), entries: [] };
+        }
+        // Prefer any confident ICD code we find for this condition
+        if (dx.icd10cm && dx.icd10cm !== "null" && !condMap[key].icd10cm) {
+          condMap[key].icd10cm = dx.icd10cm;
+        }
+        condMap[key].count++;
+        // Deduplicate entries by id — a condition could appear in multiple dx rows in the same visit
+        if (!condMap[key].entryIds.has(e.id)) {
+          condMap[key].entryIds.add(e.id);
+          condMap[key].entries.push(e);
+        }
+      });
+    });
+    return Object.values(condMap)
+      .filter(c => c.count > 0)
+      .sort((a, b) => b.count - a.count)
+      .map(c => ({ ...c, entryIds: undefined })); // drop the Set before returning
+  }, [sortedEntries]);
   const stats = useMemo(() => computeStats(results), [results]);
   const identity = useMemo(() => deriveIdentity(results), [results]);
   const doneCount = results.filter(r => r.status === "done").length;
@@ -2024,7 +2153,7 @@ export default function App() {
           onDownload={async (mode) => {
             const entries = filteredResults.length > 0 ? filteredResults : sortedEntries;
             const name = displayName || identity.fullName || "Veteran";
-            await generatePDF(entries, identity, stats, name, mode);
+            await generatePDF(entries, identity, stats, name, mode, profileDOB);
           }}
           onClose={() => setDownloadModal(false)}
         />
@@ -2303,6 +2432,127 @@ export default function App() {
               </div>
             )}
 
+            {/* Clinical Alerts — collapsed by default so it reads as informational, not an error.
+                Slim header row with a count; click to expand the full list. */}
+            {clinicalAlerts.length > 0 && (
+              <div className="no-print" style={{
+                marginBottom: 10, background: "#FFFDF7", border: "1px solid #EFE3C0", borderRadius: 10, overflow: "hidden",
+              }}>
+                <button
+                  onClick={() => setAlertsOpen(o => !o)}
+                  style={{
+                    width: "100%", display: "flex", alignItems: "center", gap: 9, padding: "11px 14px",
+                    background: "none", border: "none", cursor: "pointer", textAlign: "left",
+                  }}
+                >
+                  <AlertTriangle size={14} color="#B5852A" style={{ flex: "none" }} />
+                  <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: ".04em", color: "#B5852A" }}>
+                    CLINICAL NOTES
+                  </span>
+                  <span style={{ fontSize: 12, color: "#8A95A1" }}>
+                    {clinicalAlerts.length} item{clinicalAlerts.length === 1 ? "" : "s"} your provider may want to know about
+                  </span>
+                  {alertsOpen
+                    ? <ChevronUp size={15} color="#8A95A1" style={{ marginLeft: "auto", flex: "none" }} />
+                    : <ChevronDown size={15} color="#8A95A1" style={{ marginLeft: "auto", flex: "none" }} />}
+                </button>
+                {alertsOpen && (
+                  <div style={{ padding: "2px 14px 13px 37px", display: "flex", flexDirection: "column", gap: 8 }}>
+                    {clinicalAlerts.map((f, i) => (
+                      <div key={i} style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+                        <span style={{ width: 5, height: 5, borderRadius: 999, background: "#B5852A", flex: "none", marginTop: 7 }} />
+                        <span style={{ fontSize: 12.5, color: "#5C3D00", flex: 1, lineHeight: 1.55 }}>{f.text}</span>
+                        <span style={{ fontSize: 10.5, color: "#B5852A", fontWeight: 600, whiteSpace: "nowrap", marginTop: 2, flex: "none" }}>
+                          {f.sourceFilename.length > 24 ? f.sourceFilename.slice(0, 22) + "…" : f.sourceFilename}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Items Needing Clarification — record-keeping discrepancies, not clinical issues.
+                Collapsed by default. If a DOB discrepancy exists, the veteran can enter their
+                correct DOB — it's stored on their profile and appears on PDF printouts,
+                same pattern as the display-name chooser. */}
+            {clarifications.length > 0 && (
+              <div className="no-print" style={{
+                marginBottom: 18, background: "#FBFCFD", border: "1px solid #DDE5EC", borderRadius: 10, overflow: "hidden",
+              }}>
+                <button
+                  onClick={() => setClarifyOpen(o => !o)}
+                  style={{
+                    width: "100%", display: "flex", alignItems: "center", gap: 9, padding: "11px 14px",
+                    background: "none", border: "none", cursor: "pointer", textAlign: "left",
+                  }}
+                >
+                  <FileText size={14} color="#5C7EA3" style={{ flex: "none" }} />
+                  <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: ".04em", color: "#5C7EA3" }}>
+                    ITEMS NEEDING CLARIFICATION
+                  </span>
+                  <span style={{ fontSize: 12, color: "#8A95A1" }}>
+                    {clarifications.length} record-keeping detail{clarifications.length === 1 ? "" : "s"} you can confirm
+                  </span>
+                  {profileDOB && (
+                    <span style={{ fontSize: 11, fontWeight: 700, color: "#1E7B3C", background: "#E3F3E8", padding: "2px 9px", borderRadius: 999, flex: "none" }}>
+                      DOB confirmed
+                    </span>
+                  )}
+                  {clarifyOpen
+                    ? <ChevronUp size={15} color="#8A95A1" style={{ marginLeft: "auto", flex: "none" }} />
+                    : <ChevronDown size={15} color="#8A95A1" style={{ marginLeft: "auto", flex: "none" }} />}
+                </button>
+                {clarifyOpen && (
+                  <div style={{ padding: "2px 14px 14px 37px" }}>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: hasDOBDiscrepancy ? 14 : 0 }}>
+                      {clarifications.map((f, i) => (
+                        <div key={i} style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+                          <span style={{ width: 5, height: 5, borderRadius: 999, background: "#5C7EA3", flex: "none", marginTop: 7 }} />
+                          <span style={{ fontSize: 12.5, color: "#42505E", flex: 1, lineHeight: 1.55 }}>{f.text}</span>
+                          <span style={{ fontSize: 10.5, color: "#8A95A1", fontWeight: 600, whiteSpace: "nowrap", marginTop: 2, flex: "none" }}>
+                            {f.sourceFilename.length > 24 ? f.sourceFilename.slice(0, 22) + "…" : f.sourceFilename}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    {hasDOBDiscrepancy && (
+                      <div style={{ borderTop: "1px solid #E8EDF2", paddingTop: 12 }}>
+                        <div style={{ fontSize: 12, color: "#42505E", marginBottom: 7, fontWeight: 600 }}>
+                          Confirm your date of birth — it will appear on your profile and printed record:
+                        </div>
+                        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                          <input
+                            type="date"
+                            value={profileDOB || ""}
+                            onChange={e => setProfileDOB(e.target.value || null)}
+                            style={{
+                              fontSize: 13, padding: "8px 12px", borderRadius: 8,
+                              border: "1px solid #C9D4DD", outline: "none", background: "#fff",
+                              fontFamily: "'IBM Plex Mono', monospace", color: "#16222F",
+                            }}
+                          />
+                          {profileDOB && (
+                            <>
+                              <span style={{ fontSize: 12, color: "#1E7B3C", display: "flex", alignItems: "center", gap: 5 }}>
+                                <Check size={13} /> Saved as {formatNarrativeDate(profileDOB)}
+                              </span>
+                              <button
+                                onClick={() => setProfileDOB(null)}
+                                style={{ fontSize: 11.5, color: "#8A95A1", textDecoration: "underline", border: "none", background: "none", cursor: "pointer" }}
+                              >
+                                Clear
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Stat tiles */}
             <div id="section-overview" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 22 }} className="no-print">
               <div className="stat-tile">
@@ -2325,6 +2575,12 @@ export default function App() {
                 </div>
                 <div style={{ fontSize: 11.5, color: "#8A95A1", marginTop: 2 }}>Latest record</div>
               </div>
+              {allMedications.length > 0 && (
+                <div className="stat-tile">
+                  <div className="disp" style={{ fontSize: 24, fontWeight: 700 }}>{allMedications.length}</div>
+                  <div style={{ fontSize: 11.5, color: "#8A95A1", marginTop: 2 }}>Prescriptions found</div>
+                </div>
+              )}
             </div>
 
             {/* Browse by year, then optionally narrow by location */}
@@ -2473,6 +2729,290 @@ export default function App() {
               </div>
 
             </div>
+
+            {/* Medications — browse by year, same concept as the year timeline.
+                Year chips across the top; click a year to see what was prescribed then.
+                Compact rows keep the panel scannable. */}
+            {allMedications.length > 0 && (() => {
+              // Group medications by year of their source date
+              const medYearCounts = {};
+              allMedications.forEach(m => {
+                const yr = m.sourceDate && /^\d{4}/.test(m.sourceDate) ? m.sourceDate.slice(0, 4) : "Undated";
+                medYearCounts[yr] = (medYearCounts[yr] || 0) + 1;
+              });
+              const medYears = Object.keys(medYearCounts).sort((a, b) => b.localeCompare(a)); // newest first
+              const shownMeds = medYear
+                ? allMedications.filter(m => {
+                    const yr = m.sourceDate && /^\d{4}/.test(m.sourceDate) ? m.sourceDate.slice(0, 4) : "Undated";
+                    return yr === medYear;
+                  })
+                : [];
+
+              return (
+                <div id="section-medications" className="oath-card no-print" style={{ marginBottom: 22 }}>
+                  <div style={{ padding: "12px 16px", borderBottom: "1px solid #EEF1F4", display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: ".05em", color: "#8A95A1" }}>MEDICATIONS</span>
+                    <span className="mono" style={{ fontSize: 11.5, color: "#8A95A1" }}>
+                      {allMedications.length} prescription{allMedications.length === 1 ? "" : "s"} · select a year
+                    </span>
+                    {medYear && (
+                      <button
+                        onClick={() => setMedYear(null)}
+                        style={{ marginLeft: "auto", fontSize: 12, color: "#8A95A1", display: "flex", alignItems: "center", gap: 4, border: "none", background: "none", cursor: "pointer" }}
+                      >
+                        <X size={13} /> Close
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Year chips — brass pill styling to echo the year timeline */}
+                  <div style={{ padding: "12px 16px", display: "flex", flexWrap: "wrap", gap: 6, borderBottom: medYear ? "1px solid #EEF1F4" : "none" }}>
+                    {medYears.map(yr => {
+                      const isActive = medYear === yr;
+                      return (
+                        <button
+                          key={yr}
+                          onClick={() => setMedYear(isActive ? null : yr)}
+                          className="disp"
+                          style={{
+                            display: "inline-flex", alignItems: "center", gap: 7,
+                            padding: "5px 13px", borderRadius: 999, fontSize: 13, fontWeight: 700,
+                            background: isActive ? "#B5852A" : "#F7EFDC",
+                            color: isActive ? "#fff" : "#B5852A",
+                            border: "none", transition: "background .12s, color .12s", cursor: "pointer",
+                          }}
+                        >
+                          {yr}
+                          <span style={{
+                            fontSize: 10.5, fontWeight: 700,
+                            background: isActive ? "rgba(255,255,255,.2)" : "rgba(181,133,42,.15)",
+                            padding: "1px 7px", borderRadius: 999,
+                          }}>{medYearCounts[yr]}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Medications for the selected year — compact rows */}
+                  {medYear && (
+                    <div style={{ maxHeight: 320, overflowY: "auto" }}>
+                      {shownMeds.map((m, i) => (
+                        <div key={i} style={{
+                          display: "flex", alignItems: "baseline", gap: 12, padding: "9px 16px",
+                          borderBottom: i < shownMeds.length - 1 ? "1px solid #F4F6F8" : "none",
+                          flexWrap: "wrap",
+                        }}>
+                          <span className="mono" style={{ fontSize: 11, color: "#0E7C86", fontWeight: 600, flex: "none", width: 86 }}>
+                            {m.sourceDate ? formatNarrativeDate(m.sourceDate) : "Undated"}
+                          </span>
+                          <span style={{ fontWeight: 700, fontSize: 13, color: "#16222F" }}>{m.name}</span>
+                          {m.dose && <span style={{ fontSize: 12, color: "#5C6773" }}>{m.dose}</span>}
+                          {m.instructions && <span style={{ fontSize: 12, color: "#8A95A1" }}>{m.instructions}</span>}
+                          {m.sourceProvider && (
+                            <span style={{ fontSize: 11.5, color: "#8A95A1", marginLeft: "auto" }}>
+                              Dr. {m.sourceProvider.replace(/^Dr\.?\s*/i, "")}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* Condition Timeline — pick any diagnosis and see its full history across time.
+                Tells the clinical story of a chronic condition: when it was first noted,
+                how it was managed, every encounter where it appears. Oldest-to-newest
+                so the arc reads naturally forward in time. */}
+            {allConditions.length > 0 && (
+              <div id="section-conditions" className="oath-card no-print" style={{ marginBottom: 22 }}>
+                <div style={{ padding: "12px 16px", borderBottom: "1px solid #EEF1F4", display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: ".05em", color: "#8A95A1" }}>CONDITION TIMELINE</span>
+                  <span className="mono" style={{ fontSize: 11.5, color: "#8A95A1" }}>
+                    {allConditions.length} condition{allConditions.length === 1 ? "" : "s"} found · select one to trace its history
+                  </span>
+                  {activeCondition && (
+                    <button
+                      onClick={() => { setActiveCondition(null); setCondYear(null); }}
+                      style={{ marginLeft: "auto", fontSize: 12, color: "#8A95A1", display: "flex", alignItems: "center", gap: 4, border: "none", background: "none", cursor: "pointer" }}
+                    >
+                      <X size={13} /> Clear
+                    </button>
+                  )}
+                </div>
+
+                {/* Condition pill selector — all unique conditions, ranked by frequency */}
+                <div style={{
+                  padding: "12px 16px", display: "flex", flexWrap: "wrap", gap: 6,
+                  borderBottom: activeCondition ? "1px solid #EEF1F4" : "none",
+                  maxHeight: 160, overflowY: "auto",
+                }}>
+                  {allConditions.map(c => {
+                    const key = c.label.toLowerCase().trim();
+                    const isActive = activeCondition === key;
+                    return (
+                      <button
+                        key={key}
+                        onClick={() => { setActiveCondition(isActive ? null : key); setCondYear(null); }}
+                        style={{
+                          display: "inline-flex", alignItems: "center", gap: 6,
+                          padding: "5px 11px", borderRadius: 999, fontSize: 12.5, fontWeight: 600,
+                          background: isActive ? "#0E1C2B" : "#F4F6F8",
+                          color: isActive ? "#fff" : "#16222F",
+                          border: "1.5px solid " + (isActive ? "#0E1C2B" : "#E1E6EB"),
+                          transition: "background .12s, color .12s", cursor: "pointer",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {c.label}
+                        {c.icd10cm && (
+                          <span className="mono" style={{ fontSize: 10, opacity: 0.7 }}>{c.icd10cm}</span>
+                        )}
+                        <span style={{
+                          fontSize: 10.5, fontWeight: 700,
+                          background: isActive ? "rgba(255,255,255,.15)" : "#DDE2E7",
+                          color: isActive ? "#fff" : "#5C6773",
+                          padding: "1px 6px", borderRadius: 999,
+                        }}>{c.count}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Timeline for selected condition — summary bar + year chips.
+                    Encounters render compactly and only for the selected year,
+                    keeping the page scannable instead of a wall of text. */}
+                {activeCondition && (() => {
+                  const cond = allConditions.find(c => c.label.toLowerCase().trim() === activeCondition);
+                  if (!cond) return null;
+                  const timeline = [...cond.entries].sort((a, b) =>
+                    (a.date || "9999").localeCompare(b.date || "9999")
+                  );
+                  const first = timeline[0];
+                  const last = timeline[timeline.length - 1];
+                  const yearsSpanned = (first?.date && last?.date && first.date !== last.date)
+                    ? Math.round((new Date(last.date) - new Date(first.date)) / (365.25 * 24 * 3600 * 1000))
+                    : null;
+
+                  // Group this condition's encounters by year
+                  const condYearCounts = {};
+                  timeline.forEach(e => {
+                    const yr = e.date && /^\d{4}/.test(e.date) ? e.date.slice(0, 4) : "Undated";
+                    condYearCounts[yr] = (condYearCounts[yr] || 0) + 1;
+                  });
+                  const condYears = Object.keys(condYearCounts).sort((a, b) => a.localeCompare(b)); // oldest first — forward story
+                  const shownEncounters = condYear
+                    ? timeline.filter(e => {
+                        const yr = e.date && /^\d{4}/.test(e.date) ? e.date.slice(0, 4) : "Undated";
+                        return yr === condYear;
+                      })
+                    : [];
+
+                  return (
+                    <div style={{ padding: "14px 16px" }}>
+                      {/* Summary bar — the clinical headline for this condition */}
+                      <div style={{
+                        marginBottom: 12, padding: "10px 14px", background: "#F4F6F8",
+                        borderRadius: 10, display: "flex", flexWrap: "wrap", gap: "4px 16px", alignItems: "center",
+                      }}>
+                        <span className="disp" style={{ fontSize: 14.5, fontWeight: 700, color: "#16222F" }}>
+                          {cond.label}
+                        </span>
+                        {cond.icd10cm && (
+                          <span className="mono" style={{ fontSize: 11.5, color: "#0E7C86", fontWeight: 700 }}>
+                            {cond.icd10cm}
+                          </span>
+                        )}
+                        <span style={{ fontSize: 12, color: "#5C6773" }}>
+                          {timeline.length} encounter{timeline.length === 1 ? "" : "s"}
+                          {yearsSpanned !== null ? ` over ${yearsSpanned} year${yearsSpanned === 1 ? "" : "s"}` : ""}
+                          {first?.date ? ` · first noted ${formatNarrativeDate(first.date)}` : ""}
+                          {last?.date && last.date !== first?.date ? ` · most recent ${formatNarrativeDate(last.date)}` : ""}
+                        </span>
+                      </div>
+
+                      {/* Year chips — brass, echoing the year timeline; oldest → newest */}
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: condYear ? 12 : 0 }}>
+                        {condYears.map(yr => {
+                          const isActive = condYear === yr;
+                          return (
+                            <button
+                              key={yr}
+                              onClick={() => setCondYear(isActive ? null : yr)}
+                              className="disp"
+                              style={{
+                                display: "inline-flex", alignItems: "center", gap: 7,
+                                padding: "5px 13px", borderRadius: 999, fontSize: 13, fontWeight: 700,
+                                background: isActive ? "#B5852A" : "#F7EFDC",
+                                color: isActive ? "#fff" : "#B5852A",
+                                border: "none", transition: "background .12s, color .12s", cursor: "pointer",
+                              }}
+                            >
+                              {yr}
+                              <span style={{
+                                fontSize: 10.5, fontWeight: 700,
+                                background: isActive ? "rgba(255,255,255,.2)" : "rgba(181,133,42,.15)",
+                                padding: "1px 7px", borderRadius: 999,
+                              }}>{condYearCounts[yr]}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* Compact encounter rows for the selected year */}
+                      {condYear && (
+                        <div style={{ borderTop: "1px solid #EEF1F4" }}>
+                          {shownEncounters.map((e, i) => {
+                            const matchDx = (e.diagnoses || []).find(
+                              dx => dx.description && dx.description.toLowerCase().trim() === activeCondition
+                            );
+                            const icd = matchDx?.icd10cm || cond.icd10cm;
+                            const isFirstEver = e.id === first?.id;
+                            const isLastEver = e.id === last?.id && timeline.length > 1;
+
+                            return (
+                              <div key={e.id} style={{
+                                display: "flex", alignItems: "baseline", gap: 10, padding: "9px 4px",
+                                borderBottom: i < shownEncounters.length - 1 ? "1px solid #F4F6F8" : "none",
+                                flexWrap: "wrap",
+                              }}>
+                                <span className="mono" style={{ fontSize: 11.5, color: "#0E7C86", fontWeight: 700, flex: "none", width: 86 }}>
+                                  {formatNarrativeDate(e.date)}
+                                </span>
+                                {isFirstEver && (
+                                  <span style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: ".04em", color: "#B5852A", background: "#F7EFDC", padding: "2px 7px", borderRadius: 999 }}>
+                                    FIRST NOTED
+                                  </span>
+                                )}
+                                {isLastEver && (
+                                  <span style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: ".04em", color: "#0E7C86", background: "#E9F4F4", padding: "2px 7px", borderRadius: 999 }}>
+                                    MOST RECENT
+                                  </span>
+                                )}
+                                {e.visit_setting && e.visit_setting !== "null" && (
+                                  <span style={{ fontSize: 11.5, color: "#5C6773" }}>{e.visit_setting}</span>
+                                )}
+                                {icd && (
+                                  <span className="mono" style={{ fontSize: 10, fontWeight: 700, color: "#42505E", background: "#EEF1F4", padding: "1px 7px", borderRadius: 999 }}>
+                                    {icd}
+                                  </span>
+                                )}
+                                {(e.provider || e.facility_location) && (
+                                  <span style={{ fontSize: 11.5, color: "#8A95A1", marginLeft: "auto" }}>
+                                    {[e.provider ? `Dr. ${e.provider.replace(/^Dr\.?\s*/i, "")}` : null, e.facility_location].filter(Boolean).join(" · ")}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
 
             {/* Search — two fields: condition/code and doctor name */}
             <div id="section-search" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }} className="no-print">
